@@ -1,0 +1,137 @@
+name: Update Nuclear Data
+
+# Runs every 30 minutes, and also manually on demand
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Fetch IESO nuclear data and update JSON files
+        run: |
+          mkdir -p data
+          python3 << 'PYEOF'
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          url = 'https://reports-public.ieso.ca/public/GenOutputCapability/PUB_GenOutputCapability.xml'
+          ns  = 'http://www.theIMO.com/schema'
+
+          print(f"Fetching {url} ...")
+          req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              xml_data = resp.read()
+          print(f"Downloaded {len(xml_data):,} bytes")
+
+          root = ET.fromstring(xml_data)
+          date_el = root.find(f'.//{{{ns}}}Date')
+
+          # ── nuclear.json : snapshot complet (unités × heures) ──────────────
+          nuclear = {
+              'updated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'date':    date_el.text if date_el is not None else '',
+              'hours':   [],
+              'units':   {}
+          }
+
+          hours_detected = False
+          for gen in root.findall(f'.//{{{ns}}}Generator'):
+              name_el = gen.find(f'{{{ns}}}GeneratorName')
+              fuel_el = gen.find(f'{{{ns}}}FuelType')
+              if name_el is None or fuel_el is None:
+                  continue
+              name = name_el.text.strip()
+              fuel = fuel_el.text.strip()
+              if fuel != 'NUCLEAR':
+                  continue
+
+              outputs = gen.findall(f'.//{{{ns}}}Output')
+              if not outputs:
+                  continue
+
+              if not hours_detected:
+                  nuclear['hours'] = [
+                      int(o.find(f'{{{ns}}}Hour').text)
+                      for o in outputs
+                      if o.find(f'{{{ns}}}Hour') is not None
+                  ]
+                  hours_detected = True
+
+              mw_list = []
+              for o in outputs:
+                  mw_el = o.find(f'{{{ns}}}EnergyMW')
+                  mw_list.append(int(mw_el.text) if mw_el is not None else 0)
+              nuclear['units'][name] = mw_list
+
+          with open('data/nuclear.json', 'w') as f:
+              json.dump(nuclear, f, indent=2)
+
+          total_mw = sum(arr[-1] for arr in nuclear['units'].values() if arr)
+          print(f"nuclear.json saved: {nuclear['updated']} | {len(nuclear['units'])} units | {len(nuclear['hours'])} hours | {total_mw} MW")
+
+          # ── history.json : rolling 7 jours, résolution 30 min ───────────────
+          PLANT_GROUPS = {
+              'bruce':      ['BRUCEA-G1','BRUCEA-G2','BRUCEA-G3','BRUCEA-G4',
+                             'BRUCEB-G5','BRUCEB-G6','BRUCEB-G7','BRUCEB-G8'],
+              'darlington': ['DARLINGTON-G1','DARLINGTON-G2','DARLINGTON-G3','DARLINGTON-G4'],
+              'pickering':  ['PICKERINGB-G5','PICKERINGB-G6','PICKERINGB-G7','PICKERINGB-G8']
+          }
+
+          history_file = 'data/history.json'
+          if os.path.exists(history_file):
+              with open(history_file) as f:
+                  try:
+                      history = json.load(f)
+                  except Exception:
+                      history = {'updated': '', 'data': []}
+          else:
+              history = {'updated': '', 'data': []}
+
+          # Build current snapshot (last known MW per plant)
+          snapshot = {'ts': nuclear['updated'], 'total': 0}
+          for plant, unit_names in PLANT_GROUPS.items():
+              mw = 0
+              for u in unit_names:
+                  arr = nuclear['units'].get(u)
+                  if arr:
+                      mw += arr[-1] or 0
+              snapshot[plant] = mw
+              snapshot['total'] += mw
+
+          history['data'].append(snapshot)
+          history['updated'] = snapshot['ts']
+
+          # Keep last 336 entries = 7 days × 48 runs/day
+          MAX_ENTRIES = 336
+          if len(history['data']) > MAX_ENTRIES:
+              history['data'] = history['data'][-MAX_ENTRIES:]
+
+          with open(history_file, 'w') as f:
+              json.dump(history, f, separators=(',', ':'))
+
+          print(f"history.json saved: {len(history['data'])} entries | latest total {snapshot['total']} MW")
+          PYEOF
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/nuclear.json data/history.json
+          git diff --staged --quiet && echo "No changes." || (
+            git commit -m "data: nuclear update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          )
